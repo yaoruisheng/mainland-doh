@@ -70,6 +70,9 @@ jobs:
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           command: deploy index.js
+          wranglerVersion: '4.x'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
       - name: Save Check Status
         # 仅在部署成功时写入标记，确保下一次运行能正确命中缓存
