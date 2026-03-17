@@ -1,0 +1,84 @@
+name: Deploy Mainland DoH Worker
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force deploy regardless of IP changes"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch APNIC Data
+        id: fetch_data
+        run: |
+          curl -fsSL https://ftp.apnic.net/stats/apnic/delegated-apnic-latest -o apnic.txt
+          if [ ! -s apnic.txt ]; then
+            echo "Error: APNIC data download failed."
+            exit 1
+          fi
+
+          # 优化：解决 log() 浮点误差，通过 +0.5 强制四舍五入
+          awk -F'|' '/CN\|ipv4/ { 
+            mask = 32 - int(log($5)/log(2) + 0.5); 
+            printf("%s/%d\n", $4, mask) 
+          }' apnic.txt > cn_ipv4.txt
+          
+          awk -F'|' '/CN\|ipv6/ { print $4 "/" $5 }' apnic.txt > cn_ipv6.txt
+
+          if [ ! -s cn_ipv4.txt ] || [ ! -s cn_ipv6.txt ]; then
+            echo "Error: IP parsing failed."
+            exit 1
+          fi
+
+          echo "DATA_HASH=$(md5sum cn_ipv4.txt cn_ipv6.txt | md5sum | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Check Cache for IP Changes
+        id: ip-cache
+        uses: actions/cache@v4
+        with:
+          path: .check_status
+          key: ip-data-${{ env.DATA_HASH }}
+          restore-keys: |
+            ip-data-
+
+      - name: Setup Node.js
+        if: github.event.inputs.force == true || github.event.inputs.force == 'true' || steps.ip-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build
+        if: github.event.inputs.force == true || github.event.inputs.force == 'true' || steps.ip-cache.outputs.cache-hit != 'true'
+        env:
+          CORE_LOGIC: ${{ vars.CORE_LOGIC }}
+        run: node scripts/build.js
+
+      - name: Deploy
+        id: deploy
+        if: github.event.inputs.force == true || github.event.inputs.force == 'true' || steps.ip-cache.outputs.cache-hit != 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: deploy index.js
+
+      - name: Save Check Status
+        # 仅在部署成功时写入标记，确保下一次运行能正确命中缓存
+        if: steps.deploy.outcome == 'success'
+        run: echo "deploy_done" > .check_status
+
+      - name: Final Summary
+        run: |
+          if [ "${{ steps.ip-cache.outputs.cache-hit }}" == "true" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            echo "✅ IP data is up-to-date. Skipping deployment."
+          else
+            echo "🚀 Deployment completed successfully."
+          fi
