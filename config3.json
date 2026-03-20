@@ -1,0 +1,101 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "dns": {
+    "queryStrategy": "UseIP",
+    "cacheStrategy": "UseIP",
+    "disableFallbackIfMatch": true,
+    "disableCache": false,
+    "hosts": {
+      "dns.google": [
+        "8.8.8.8",
+        "8.8.4.4",
+        "2001:4860:4860::8888",
+        "2001:4860:4860::8844"
+      ]
+    },
+    "servers": [
+      {
+        "address": "223.5.5.5",
+        "port": 53,
+        "domains": [
+          "geosite:cn",
+          "domain:cloudflareclient.com",
+          "domain:cloudflareaccess.com",
+          "domain:cloudflareportal.com",
+          "domain:cloudflareok.com",
+          "domain:cloudflarecp.com",
+          "domain:www.msftconnecttest.com",
+          "domain:captive.apple.com",
+          "domain:connectivitycheck.gstatic.com",
+          "domain:cloudflare-gateway.com",
+          "domain:cloudflare-dns.com",
+          "domain:cloudflare.com",
+          "domain:argotunnel.com",
+          "domain:cftunnel.com",
+          "domain:cloudflareresearch.com"
+        ],
+        "skipFallback": true
+      },
+      {
+        "address": "https://dns.google/dns-query",
+        "domains": ["geosite:geolocation-!cn"]
+      },
+      {
+        "address": "223.5.5.5",
+        "port": 53
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.3.1",
+      "port": 53,
+      "protocol": "dokodemo-door",
+      "tag": "dns-in",
+      "settings": {
+        "network": "tcp,udp",
+        "followRedirect": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "dns",
+      "tag": "dns-out",
+      "settings": {
+        "address": "223.5.5.5",
+        "port": 53,
+        "network": "udp",
+        "nonIPQuery": "skip"
+      }
+    },
+    {
+      "protocol": "socks",
+      "tag": "warp-proxy",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": 40000
+          }
+        ]
+      }
+    }
+  ],
+"routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["dns-in"],
+        "outboundTag": "dns-out"
+      },
+      {
+        "type": "field",
+        "domain": ["dns.google"],
+        "outboundTag": "warp-proxy"
+      }
+    ]
+  }
+}
