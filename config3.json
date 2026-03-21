@@ -40,7 +40,9 @@
       },
       {
         "address": "https://dns.google/dns-query",
-        "domains": ["geosite:geolocation-!cn"]
+        "domains": [
+          "geosite:geolocation-!cn"
+        ]
       },
       {
         "address": "223.5.5.5",
@@ -61,6 +63,11 @@
     }
   ],
   "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "settings": {}
+    },
     {
       "protocol": "dns",
       "tag": "dns-out",
@@ -84,17 +91,27 @@
       }
     }
   ],
-"routing": {
+  "routing": {
+    "domainStrategy": "AsIs",
     "rules": [
       {
         "type": "field",
-        "inboundTag": ["dns-in"],
+        "inboundTag": [
+          "dns-in"
+        ],
         "outboundTag": "dns-out"
       },
       {
         "type": "field",
-        "domain": ["dns.google"],
+        "domain": [
+          "dns.google"
+        ],
         "outboundTag": "warp-proxy"
+      },
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "direct"
       }
     ]
   }
