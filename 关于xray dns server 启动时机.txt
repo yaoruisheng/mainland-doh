@@ -21,3 +21,20 @@ network-online.target
 其它服务
 
 这样很多依赖网络的程序会 在 Xray 后启动。
+
+
+设置
+nameserver 127.0.3.1
+nameserver 223.5.5.5
+
+再加：
+
+options timeout:1 attempts:1
+
+效果：
+
+xray没启动
+↓
+1秒内 fallback
+
+系统不会卡。
