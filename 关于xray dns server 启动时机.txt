@@ -1,0 +1,23 @@
+修改 Xray 的 service。
+
+打开：
+
+sudo systemctl edit xray
+
+加入：
+
+[Unit]
+After=network.target
+Before=network-online.target
+
+意思是：
+
+network.target
+      ↓
+   xray
+      ↓
+network-online.target
+      ↓
+其它服务
+
+这样很多依赖网络的程序会 在 Xray 后启动。
