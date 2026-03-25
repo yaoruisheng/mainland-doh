@@ -10,7 +10,7 @@ const ECS_CONFIG = {
 };
 
 const CACHE_TTL_MAX = 31536000;   // 1年
-const CACHE_TTL_MIN = 60;          // 最小60秒
+const CACHE_TTL_MIN = 60;          // 最小60秒（仅用于无有效TTL时）
 const UPSTREAM_TIMEOUT = 5000;     // 5秒超时
 
 const UPSTREAM_URL = 'https://dns.google/dns-query';
@@ -101,11 +101,11 @@ function getSubnetKey(ip, prefix) {
 
 /**
  * 解析 DNS 查询报文
+ * 返回 { qname, qtype, qclass, doFlag, ednsVersion }
  */
 function parseDNSQuery(buffer) {
   if (buffer.byteLength < 12 || buffer.byteLength > 4096) return null;
   const pkt = new Uint8Array(buffer);
-  // 直接使用 Uint8Array 索引，避免 DataView 开销
   const flags = (pkt[2] << 8) | pkt[3];
   const qdCount = (pkt[4] << 8) | pkt[5];
   if ((flags >> 15) !== 0 || ((flags >> 11) & 0xf) !== 0 || qdCount !== 1) return null;
@@ -134,15 +134,11 @@ function parseDNSQuery(buffer) {
       ptrDepth++;
       continue;
     }
-    if (len > 63) return null;
+    if (len > 63) return null;          // 标签长度超限
     pos++;
     if (pos + len > pkt.length) return null;
     const labelBytes = pkt.subarray(pos, pos + len);
-    // 快速字符合法性检查（允许 ASCII 字符）
-    for (let i = 0; i < labelBytes.length; i++) {
-      const c = labelBytes[i];
-      if (c < 32 || c === 127) return null;
-    }
+    // 移除字符合法性检查（允许任意 8 位字节，符合 RFC 1035）
     nameLabels.push(decoder.decode(labelBytes));
     pos += len;
   }
@@ -152,12 +148,13 @@ function parseDNSQuery(buffer) {
   if (firstNextPos + 4 > pkt.length) return null;
   const qtype = (pkt[firstNextPos] << 8) | pkt[firstNextPos + 1];
   const qclass = (pkt[firstNextPos + 2] << 8) | pkt[firstNextPos + 3];
-  if (qclass !== 1) return null;
+  // 移除 qclass === 1 的硬性限制，允许所有类
 
   // 解析 EDNS（OPT RR）
   let arPos = firstNextPos + 4;
   const arCount = (pkt[10] << 8) | pkt[11];
   let doFlag = 0;
+  let ednsVersion = 0;
   for (let i = 0; i < arCount; i++) {
     // 快速跳过 RR 的 NAME（可能压缩）
     let rrPos = arPos;
@@ -180,20 +177,23 @@ function parseDNSQuery(buffer) {
     if (type === 41) {
       const ttl = (pkt[rrPos + 4] << 24) | (pkt[rrPos + 5] << 16) | (pkt[rrPos + 6] << 8) | pkt[rrPos + 7];
       doFlag = (ttl & 0x8000) ? 1 : 0;
+      ednsVersion = (ttl >> 16) & 0xff;          // 提取 EDNS 版本（TTL 高 8 位）
     }
     arPos = rrPos + 10 + rdlen;
   }
-  return { qname, qtype, doFlag };
+  return { qname, qtype, qclass, doFlag, ednsVersion };
 }
 
-// ==================== TTL 解析（高性能版）====================
+// ==================== TTL 解析（支持负响应）====================
 
 /**
- * 从 DNS 响应中提取最小 TTL
+ * 从 DNS 响应中提取最小 TTL（支持负响应的 SOA MINIMUM）
  */
 function parseMinTTL(buffer) {
   const pkt = new Uint8Array(buffer);
   if (pkt.length < 12) return CACHE_TTL_MIN;
+  const flags = (pkt[2] << 8) | pkt[3];
+  const rcode = flags & 0x0f;
   const qdCount = (pkt[4] << 8) | pkt[5];
   const anCount = (pkt[6] << 8) | pkt[7];
   const nsCount = (pkt[8] << 8) | pkt[9];
@@ -201,7 +201,6 @@ function parseMinTTL(buffer) {
 
   // 跳过 Question 节
   for (let i = 0; i < qdCount; i++) {
-    // 跳过域名（压缩或普通）
     while (pos < pkt.length) {
       const len = pkt[pos];
       if (len === 0) { pos++; break; }
@@ -212,9 +211,10 @@ function parseMinTTL(buffer) {
   }
 
   let minTTL = Infinity;
+  let soaMin = Infinity;  // 用于负响应
 
   // 遍历资源记录
-  function processRRs(count) {
+  function processRRs(count, isAuthority) {
     for (let i = 0; i < count; i++) {
       if (pos + 12 > pkt.length) break;
       // 跳过域名
@@ -228,18 +228,63 @@ function parseMinTTL(buffer) {
         }
       }
       if (pos + 10 > pkt.length) break;
+      const type = (pkt[pos] << 8) | pkt[pos + 1];
       const ttl = (pkt[pos + 4] << 24) | (pkt[pos + 5] << 16) | (pkt[pos + 6] << 8) | pkt[pos + 7];
       const rdlen = (pkt[pos + 8] << 8) | pkt[pos + 9];
-      if (ttl < minTTL) minTTL = ttl;
+      if (pos + 10 + rdlen > pkt.length) break;
+
+      if (type === 6 && isAuthority) {  // SOA 记录
+        // 解析 SOA 的 MINIMUM 字段（位于最后 4 字节）
+        if (rdlen >= 20) {
+          const dataStart = pos + 10;
+          // 跳过 MNAME, RNAME 等变长字段，简单定位到 MINIMUM（最后 4 字节）
+          let offset = dataStart;
+          let depth = 0;
+          while (offset < dataStart + rdlen - 4 && depth < 10) {
+            const len = pkt[offset];
+            if (len === 0) { offset++; break; }
+            if ((len & 0xc0) === 0xc0) { offset += 2; break; }
+            offset += len + 1;
+            depth++;
+          }
+          // 再跳过 RNAME
+          depth = 0;
+          while (offset < dataStart + rdlen - 4 && depth < 10) {
+            const len = pkt[offset];
+            if (len === 0) { offset++; break; }
+            if ((len & 0xc0) === 0xc0) { offset += 2; break; }
+            offset += len + 1;
+            depth++;
+          }
+          // 跳过 SERIAL, REFRESH, RETRY, EXPIRE (各 4 字节)
+          offset += 16;
+          if (offset + 4 <= dataStart + rdlen) {
+            const minimum = (pkt[offset] << 24) | (pkt[offset + 1] << 16) | (pkt[offset + 2] << 8) | pkt[offset + 3];
+            soaMin = Math.min(soaMin, minimum);
+          }
+        }
+      } else if (ttl < minTTL) {
+        minTTL = ttl;
+      }
       pos += 10 + rdlen;
     }
   }
 
-  processRRs(anCount);
-  processRRs(nsCount);
+  processRRs(anCount, false);
+  processRRs(nsCount, true);
 
-  if (!isFinite(minTTL)) minTTL = CACHE_TTL_MIN;
-  return Math.min(CACHE_TTL_MAX, Math.max(CACHE_TTL_MIN, minTTL));
+  // 负响应处理：NXDOMAIN 或 NODATA (RCODE!=0 或 ANCOUNT==0)
+  const isNegative = (rcode !== 0) || (anCount === 0 && nsCount > 0);
+  let ttl;
+  if (isNegative && isFinite(soaMin)) {
+    ttl = soaMin;
+  } else if (isFinite(minTTL)) {
+    ttl = minTTL;
+  } else {
+    ttl = CACHE_TTL_MIN;
+  }
+  // 允许 0 TTL，不再强制下限
+  return Math.min(CACHE_TTL_MAX, ttl);
 }
 
 // ==================== ECS 注入（高性能版）====================
@@ -261,21 +306,28 @@ function skipName(pkt, pos) {
     }
     if ((label & 0xc0) === 0xc0) {
       if (newPos + 1 >= pkt.length) return -1;
-      // 压缩指针，跳过指针本身
       newPos += 2;
       break;
     }
     if (label > 63) return -1; // 标签长度非法
     newPos += label + 1;
-    if (++depth > 100) return -1; // 防止无限循环
+    if (++depth > 100) return -1;
   }
   return newPos;
 }
 
 /**
- * 在 DNS 请求中注入 EDNS Client Subnet
+ * 在 DNS 请求中注入 EDNS Client Subnet（若 EDNS 版本为 0）
+ * @param {ArrayBuffer} buffer - 原始请求
+ * @param {string} clientIP - 客户端 IP
+ * @param {number} prefix - 掩码长度
+ * @param {number} ednsVersion - 请求中的 EDNS 版本
+ * @returns {ArrayBuffer} 注入后的请求（若版本不为 0 则原样返回）
  */
-function injectECS(buffer, clientIP, prefix) {
+function injectECS(buffer, clientIP, prefix, ednsVersion) {
+  // 若 EDNS 版本不为 0，不注入 ECS（符合 RFC 6891）
+  if (ednsVersion !== 0) return buffer;
+
   const pkt = new Uint8Array(buffer);
   if (pkt.length < 12) return buffer;
 
@@ -296,7 +348,6 @@ function injectECS(buffer, clientIP, prefix) {
   for (let i = 0; i < arCount; i++) {
     if (cursor + 11 > pkt.length) break;
     const rrStart = cursor;
-    // 跳过 RR 的 NAME
     cursor = skipName(pkt, cursor);
     if (cursor === -1 || cursor + 10 > pkt.length) break;
     const type = (pkt[cursor] << 8) | pkt[cursor + 1];
@@ -308,7 +359,6 @@ function injectECS(buffer, clientIP, prefix) {
         optEnd = rrEnd;
         foundOpt = true;
       }
-      // 若有多个 OPT RR，忽略后续（符合 RFC 要求）
     }
     cursor = rrEnd;
   }
@@ -331,15 +381,14 @@ function injectECS(buffer, clientIP, prefix) {
   ecsOption[7] = 0;                                   // SCOPE PREFIX-LENGTH
   ecsOption.set(addr, 8);
 
-  const UDP_PAYLOAD_SIZE = 4096; // RFC 6891 要求至少 512
+  const UDP_PAYLOAD_SIZE = 4096;
 
   if (optStart !== -1) {
     // 替换现有 OPT RR
     const oldOpt = pkt.subarray(optStart, optEnd);
     if (oldOpt.length < 11) return buffer;
-    // 提取旧 OPT RR 头部（前 11 字节）
     const oldHeader = oldOpt.subarray(0, 11);
-    // 保留原始 CLASS 和 TTL，但确保 CLASS >= 512
+    // 保留原 CLASS（UDP payload size），仅确保不小于 512（RFC 6891 建议）
     let oldClass = (oldHeader[3] << 8) | oldHeader[4];
     if (oldClass < 512) oldClass = UDP_PAYLOAD_SIZE;
     const ttl = oldHeader.subarray(5, 9); // 4 字节 TTL（含 EDNS 版本、标志）
@@ -350,7 +399,7 @@ function injectECS(buffer, clientIP, prefix) {
     while (offset + 4 <= oldOpt.length) {
       const code = (oldOpt[offset] << 8) | oldOpt[offset + 1];
       const len = (oldOpt[offset + 2] << 8) | oldOpt[offset + 3];
-      if (offset + 4 + len > oldOpt.length) break; // 边界检查
+      if (offset + 4 + len > oldOpt.length) break;
       if (code !== 8) {
         otherOpts.push(oldOpt.subarray(offset, offset + 4 + len));
       }
@@ -367,7 +416,7 @@ function injectECS(buffer, clientIP, prefix) {
     newOpt[0] = 0;                         // NAME = 根域
     newOpt[1] = 0; newOpt[2] = 41;         // TYPE = 41
     newOpt[3] = (oldClass >> 8) & 0xff;
-    newOpt[4] = oldClass & 0xff;           // CLASS = UDP payload size
+    newOpt[4] = oldClass & 0xff;           // CLASS = UDP payload size（保留原值或提升后值）
     newOpt.set(ttl, 5);                    // 保留原 TTL
     newOpt[9] = (newRdlen >> 8) & 0xff;
     newOpt[10] = newRdlen & 0xff;          // RDLEN
@@ -431,28 +480,35 @@ async function handleDoH(request, env, ctx) {
     const parsed = parseDNSQuery(queryBuffer);
     if (!parsed) return new Response('Bad Request', { status: 400 });
 
-    // 构建缓存键
+    // 构建缓存键（包含 qclass）
     const isV6 = clientIP.includes(':');
     const prefix = isV6 ? ECS_CONFIG.ipv6Prefix : ECS_CONFIG.ipv4Prefix;
     const subnetKey = getSubnetKey(clientIP, prefix);
-    const cacheKey = `https://cache.local/${parsed.qname}/${parsed.qtype}/${parsed.doFlag}/${subnetKey}`;
+    // 若客户端 IP 无效，跳过缓存
+    const useCache = subnetKey !== 'unknown';
+    const cacheKey = useCache
+      ? `https://cache.local/${parsed.qname}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}/${subnetKey}`
+      : null;
 
     // 缓存读取
     const cache = caches.default;
     let cached;
-    try {
-      cached = await cache.match(cacheKey);
-    } catch (err) {
-      if (err.status !== 504) console.error('Cache match error:', err);
+    if (useCache) {
+      try {
+        cached = await cache.match(cacheKey);
+      } catch (err) {
+        if (err.status !== 504) console.error('Cache match error:', err);
+      }
     }
     if (cached) return cached;
 
-    // 请求合并
-    if (inflight.has(cacheKey)) return inflight.get(cacheKey);
+    // 请求合并（使用与缓存相同的键，若未使用缓存则用临时键）
+    const mergeKey = useCache ? cacheKey : `merge:${parsed.qname}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}`;
+    if (inflight.has(mergeKey)) return inflight.get(mergeKey);
 
     const promise = (async () => {
-      // 注入 ECS 并请求上游
-      const finalQuery = injectECS(queryBuffer, clientIP, prefix);
+      // 注入 ECS 并请求上游（传递 EDNS 版本）
+      const finalQuery = injectECS(queryBuffer, clientIP, prefix, parsed.ednsVersion);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
       let upstreamRes;
@@ -475,7 +531,7 @@ async function handleDoH(request, env, ctx) {
       }
 
       const responseBody = await upstreamRes.arrayBuffer();
-      const ttl = parseMinTTL(responseBody);
+      const ttl = parseMinTTL(responseBody);  // 已支持 0 TTL
 
       const response = new Response(responseBody, {
         headers: {
@@ -484,17 +540,18 @@ async function handleDoH(request, env, ctx) {
         },
       });
 
-      if (ctx?.waitUntil) {
+      // 仅在 TTL > 0 且可以使用缓存时存入缓存
+      if (useCache && ttl > 0 && ctx?.waitUntil) {
         ctx.waitUntil(cache.put(cacheKey, response.clone()));
       }
       return response;
     })();
 
-    inflight.set(cacheKey, promise);
+    inflight.set(mergeKey, promise);
     try {
       return await promise;
     } finally {
-      inflight.delete(cacheKey);
+      inflight.delete(mergeKey);
     }
   } catch (err) {
     console.error('DoH handler error:', err);
