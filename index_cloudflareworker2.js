@@ -245,6 +245,34 @@ function parseMinTTL(buffer) {
 // ==================== ECS 注入（高性能版）====================
 
 /**
+ * 跳过 DNS 域名（支持压缩指针，RFC 1035）
+ * @param {Uint8Array} pkt - DNS 报文
+ * @param {number} pos - 起始偏移量
+ * @returns {number} 跳过后的新偏移量，若无效返回 -1
+ */
+function skipName(pkt, pos) {
+  let depth = 0;
+  let newPos = pos;
+  while (newPos < pkt.length) {
+    const label = pkt[newPos];
+    if (label === 0) {
+      newPos++;
+      break;
+    }
+    if ((label & 0xc0) === 0xc0) {
+      if (newPos + 1 >= pkt.length) return -1;
+      // 压缩指针，跳过指针本身
+      newPos += 2;
+      break;
+    }
+    if (label > 63) return -1; // 标签长度非法
+    newPos += label + 1;
+    if (++depth > 100) return -1; // 防止无限循环
+  }
+  return newPos;
+}
+
+/**
  * 在 DNS 请求中注入 EDNS Client Subnet
  */
 function injectECS(buffer, clientIP, prefix) {
@@ -255,40 +283,34 @@ function injectECS(buffer, clientIP, prefix) {
   let pos = 12;
   const qdCount = (pkt[4] << 8) | pkt[5];
   for (let i = 0; i < qdCount; i++) {
-    while (pos < pkt.length) {
-      const l = pkt[pos];
-      if (l === 0) { pos++; break; }
-      if ((l & 0xc0) === 0xc0) { pos += 2; break; }
-      pos += l + 1;
-    }
-    pos += 4;
+    pos = skipName(pkt, pos);
+    if (pos === -1 || pos + 4 > pkt.length) return buffer;
+    pos += 4; // QTYPE + QCLASS
   }
 
   // 查找现有 OPT RR
   let arCount = (pkt[10] << 8) | pkt[11];
   let optStart = -1, optEnd = -1;
   let cursor = pos;
+  let foundOpt = false;
   for (let i = 0; i < arCount; i++) {
     if (cursor + 11 > pkt.length) break;
-    let rrPos = cursor;
-    if ((pkt[rrPos] & 0xc0) === 0xc0) {
-      rrPos += 2;
-    } else {
-      while (rrPos < pkt.length) {
-        const l = pkt[rrPos++];
-        if (l === 0) break;
-        rrPos += l;
-      }
-    }
-    if (rrPos + 10 > pkt.length) break;
-    const type = (pkt[rrPos] << 8) | pkt[rrPos + 1];
-    const rdlen = (pkt[rrPos + 8] << 8) | pkt[rrPos + 9];
+    const rrStart = cursor;
+    // 跳过 RR 的 NAME
+    cursor = skipName(pkt, cursor);
+    if (cursor === -1 || cursor + 10 > pkt.length) break;
+    const type = (pkt[cursor] << 8) | pkt[cursor + 1];
+    const rdlen = (pkt[cursor + 8] << 8) | pkt[cursor + 9];
+    const rrEnd = cursor + 10 + rdlen;
     if (type === 41) {
-      optStart = cursor;
-      optEnd = rrPos + 10 + rdlen;
-      break;
+      if (!foundOpt) {
+        optStart = rrStart;
+        optEnd = rrEnd;
+        foundOpt = true;
+      }
+      // 若有多个 OPT RR，忽略后续（符合 RFC 要求）
     }
-    cursor = rrPos + 10 + rdlen;
+    cursor = rrEnd;
   }
 
   // 准备 ECS 数据
@@ -298,38 +320,59 @@ function injectECS(buffer, clientIP, prefix) {
   const actualPrefix = prefix ?? (isV6 ? ECS_CONFIG.ipv6Prefix : ECS_CONFIG.ipv4Prefix);
   const addr = applyPrefixMask(ipBytes, actualPrefix).subarray(0, Math.ceil(actualPrefix / 8));
 
-  const ecsOptionLen = 2 + 1 + 1 + addr.length; // CODE(2) + LEN(2) + FAMILY(2) + SOURCE(1) + SCOPE(1) + ADDR
-  const ecsOption = new Uint8Array(4 + ecsOptionLen);
+  const ecsDataLen = 2 + 1 + 1 + addr.length; // FAMILY(2) + SOURCE(1) + SCOPE(1) + ADDR
+  const ecsOption = new Uint8Array(4 + ecsDataLen);
   ecsOption[0] = 0; ecsOption[1] = 8;                 // OPTION-CODE = 8
-  ecsOption[2] = ecsOptionLen >> 8;                   // OPTION-LENGTH
-  ecsOption[3] = ecsOptionLen & 0xff;
+  ecsOption[2] = ecsDataLen >> 8;                     // OPTION-LENGTH
+  ecsOption[3] = ecsDataLen & 0xff;
   ecsOption[4] = 0;                                   // FAMILY 高字节
   ecsOption[5] = isV6 ? 2 : 1;                        // FAMILY 低字节
   ecsOption[6] = actualPrefix;                        // SOURCE PREFIX-LENGTH
   ecsOption[7] = 0;                                   // SCOPE PREFIX-LENGTH
   ecsOption.set(addr, 8);
 
-  // 如果存在 OPT RR，替换；否则新增
+  const UDP_PAYLOAD_SIZE = 4096; // RFC 6891 要求至少 512
+
   if (optStart !== -1) {
+    // 替换现有 OPT RR
     const oldOpt = pkt.subarray(optStart, optEnd);
+    if (oldOpt.length < 11) return buffer;
+    // 提取旧 OPT RR 头部（前 11 字节）
+    const oldHeader = oldOpt.subarray(0, 11);
+    // 保留原始 CLASS 和 TTL，但确保 CLASS >= 512
+    let oldClass = (oldHeader[3] << 8) | oldHeader[4];
+    if (oldClass < 512) oldClass = UDP_PAYLOAD_SIZE;
+    const ttl = oldHeader.subarray(5, 9); // 4 字节 TTL（含 EDNS 版本、标志）
+
     // 遍历旧选项，收集非 ECS 选项
     const otherOpts = [];
     let offset = 11;
     while (offset + 4 <= oldOpt.length) {
       const code = (oldOpt[offset] << 8) | oldOpt[offset + 1];
       const len = (oldOpt[offset + 2] << 8) | oldOpt[offset + 3];
+      if (offset + 4 + len > oldOpt.length) break; // 边界检查
       if (code !== 8) {
         otherOpts.push(oldOpt.subarray(offset, offset + 4 + len));
       }
       offset += 4 + len;
     }
+
     // 计算新 OPT RR 总长度
-    let newOptLen = 11 + ecsOption.length;
-    for (const opt of otherOpts) newOptLen += opt.length;
+    let newRdlen = ecsOption.length;
+    for (const opt of otherOpts) newRdlen += opt.length;
+    const newOptLen = 11 + newRdlen;
     const newOpt = new Uint8Array(newOptLen);
-    newOpt.set(oldOpt.subarray(0, 11), 0);  // 复制 OPT RR 头部
-    newOpt[9] = (newOptLen - 11) >> 8;
-    newOpt[10] = (newOptLen - 11) & 0xff;
+
+    // 构造新 OPT RR 头部
+    newOpt[0] = 0;                         // NAME = 根域
+    newOpt[1] = 0; newOpt[2] = 41;         // TYPE = 41
+    newOpt[3] = (oldClass >> 8) & 0xff;
+    newOpt[4] = oldClass & 0xff;           // CLASS = UDP payload size
+    newOpt.set(ttl, 5);                    // 保留原 TTL
+    newOpt[9] = (newRdlen >> 8) & 0xff;
+    newOpt[10] = newRdlen & 0xff;          // RDLEN
+
+    // 写入选项
     let wpos = 11;
     newOpt.set(ecsOption, wpos);
     wpos += ecsOption.length;
@@ -337,31 +380,32 @@ function injectECS(buffer, clientIP, prefix) {
       newOpt.set(opt, wpos);
       wpos += opt.length;
     }
+
     // 拼接最终报文
-    const newPkt = new Uint8Array(pkt.length - (optEnd - optStart) + newOpt.length);
+    const newPkt = new Uint8Array(pkt.length - (optEnd - optStart) + newOptLen);
     newPkt.set(pkt.subarray(0, optStart), 0);
     newPkt.set(newOpt, optStart);
-    newPkt.set(pkt.subarray(optEnd), optStart + newOpt.length);
+    newPkt.set(pkt.subarray(optEnd), optStart + newOptLen);
     return newPkt.buffer;
   } else {
     // 新增 OPT RR
-    const optRR = new Uint8Array(11 + ecsOption.length);
-    optRR[0] = optRR[1] = 0;      // NAME 为 0
-    optRR[2] = 0; optRR[3] = 41;  // TYPE = 41
-    optRR[4] = 0; optRR[5] = 16;  // CLASS = 16 (UDP 最大尺寸)
-    optRR[6] = 0; optRR[7] = 0;   // TTL = 0
-    optRR[8] = 0; optRR[9] = 0;   // RDLEN 占位
-    optRR[10] = 0;
+    const newOpt = new Uint8Array(11 + ecsOption.length);
+    newOpt[0] = 0;                         // NAME = 根域
+    newOpt[1] = 0; newOpt[2] = 41;         // TYPE = 41
+    newOpt[3] = (UDP_PAYLOAD_SIZE >> 8) & 0xff;
+    newOpt[4] = UDP_PAYLOAD_SIZE & 0xff;   // CLASS = UDP payload size
+    newOpt[5] = 0; newOpt[6] = 0; newOpt[7] = 0; newOpt[8] = 0; // TTL = 0（EDNS 版本 0）
     const rdlen = ecsOption.length;
-    optRR[9] = rdlen >> 8;
-    optRR[10] = rdlen & 0xff;
-    optRR.set(ecsOption, 11);
-    const newPkt = new Uint8Array(pkt.length + optRR.length);
+    newOpt[9] = (rdlen >> 8) & 0xff;
+    newOpt[10] = rdlen & 0xff;             // RDLEN
+    newOpt.set(ecsOption, 11);             // RDATA
+
+    const newPkt = new Uint8Array(pkt.length + newOpt.length);
     newPkt.set(pkt, 0);
-    newPkt.set(optRR, pkt.length);
+    newPkt.set(newOpt, pkt.length);
     // 更新 ARCOUNT
     const newArCount = arCount + 1;
-    newPkt[10] = newArCount >> 8;
+    newPkt[10] = (newArCount >> 8) & 0xff;
     newPkt[11] = newArCount & 0xff;
     return newPkt.buffer;
   }
@@ -457,7 +501,6 @@ async function handleDoH(request, env, ctx) {
     return new Response('Internal Server Error', { status: 500 });
   }
 }
-
 
 /**
  * =========================
