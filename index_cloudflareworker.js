@@ -100,11 +100,12 @@ function getSubnetKey(ip, prefix) {
 
 /**
  * 解析 DNS 查询报文
- * 返回 { qname, qtype, qclass, doFlag, ednsVersion }
+ * 返回 { qname, qtype, qclass, doFlag, ednsVersion, id }
  */
 function parseDNSQuery(buffer) {
   if (buffer.byteLength < 12 || buffer.byteLength > 4096) return null;
   const pkt = new Uint8Array(buffer);
+  const id = (pkt[0] << 8) | pkt[1];  // 提取事务 ID
   const flags = (pkt[2] << 8) | pkt[3];
   const qdCount = (pkt[4] << 8) | pkt[5];
   if ((flags >> 15) !== 0 || ((flags >> 11) & 0xf) !== 0 || qdCount !== 1) return null;
@@ -184,7 +185,7 @@ function parseDNSQuery(buffer) {
     }
     arPos = rrPos + 10 + rdlen;
   }
-  return { qname, qtype, qclass, doFlag, ednsVersion };
+  return { qname, qtype, qclass, doFlag, ednsVersion, id };
 }
 
 // ==================== TTL 解析（支持负响应）====================
@@ -465,6 +466,23 @@ function injectECS(buffer, clientIP, prefix, ednsVersion) {
   }
 }
 
+// ==================== DNS ID 修正 ====================
+
+/**
+ * 修正 DNS 响应中的事务 ID 为指定值
+ * @param {ArrayBuffer} responseBuffer - 原始响应
+ * @param {number} id - 新的 ID (0-65535)
+ * @returns {ArrayBuffer} 修正后的响应
+ */
+function fixDNSId(responseBuffer, id) {
+  const buf = new Uint8Array(responseBuffer);
+  if (buf.length < 2) return responseBuffer;
+  const newBuf = new Uint8Array(buf);
+  newBuf[0] = (id >> 8) & 0xff;
+  newBuf[1] = id & 0xff;
+  return newBuf.buffer;
+}
+
 // ==================== 主处理函数 ====================
 
 async function handleDoH(request, env, ctx) {
@@ -489,7 +507,6 @@ async function handleDoH(request, env, ctx) {
     const isV6 = clientIP.includes(':');
     const prefix = isV6 ? ECS_CONFIG.ipv6Prefix : ECS_CONFIG.ipv4Prefix;
     const subnetKey = getSubnetKey(clientIP, prefix);
-    // 若客户端 IP 无效，跳过缓存
     const useCache = subnetKey !== 'unknown';
     const cacheKey = useCache
       ? `https://cache.local/${parsed.qname}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}/${subnetKey}`
@@ -505,12 +522,28 @@ async function handleDoH(request, env, ctx) {
         if (err.status !== 504) console.error('Cache match error:', err);
       }
     }
-    if (cached) return cached;
+    if (cached) {
+      // 从缓存获取响应体，修正 ID 后返回
+      const responseBody = await cached.arrayBuffer();
+      const fixedBody = fixDNSId(responseBody, parsed.id);
+      // 复制原响应头（不含 content-length，因为长度不变）
+      const headers = new Headers(cached.headers);
+      // 若原响应有 cache-control，保留（但已设置 max-age）
+      const newResponse = new Response(fixedBody, { headers });
+      return newResponse;
+    }
 
     // 请求合并（使用与缓存相同的键，若未使用缓存则用临时键）
     const mergeKey = useCache ? cacheKey : `merge:${parsed.qname}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}`;
-    if (inflight.has(mergeKey)) return inflight.get(mergeKey);
+    if (inflight.has(mergeKey)) {
+      // 等待共享的响应数据，然后修正 ID 并返回
+      const shared = await inflight.get(mergeKey);
+      const fixedBody = fixDNSId(shared.buffer, parsed.id);
+      const response = new Response(fixedBody, { headers: shared.headers });
+      return response;
+    }
 
+    // 创建新的请求
     const promise = (async () => {
       // 注入 ECS 并请求上游（传递 EDNS 版本）
       const finalQuery = injectECS(queryBuffer, clientIP, prefix, parsed.ednsVersion);
@@ -532,29 +565,42 @@ async function handleDoH(request, env, ctx) {
       }
 
       if (!upstreamRes.ok) {
-        return new Response('Upstream DNS error', { status: 502 });
+        throw new Error(`Upstream responded with ${upstreamRes.status}`);
       }
 
       const responseBody = await upstreamRes.arrayBuffer();
-      const ttl = parseMinTTL(responseBody);  // 已支持 0 TTL
+      const ttl = parseMinTTL(responseBody);
+      const headers = {
+        'content-type': 'application/dns-message',
+      };
+      if (ttl > 0) {
+        headers['cache-control'] = `max-age=${ttl}`;
+      } else {
+        headers['cache-control'] = 'no-store';
+      }
 
-      const response = new Response(responseBody, {
-        headers: {
-          'content-type': 'application/dns-message',
-          'cache-control': `max-age=${ttl}`,
-        },
-      });
+      // 存储原始响应数据（未修正 ID）供其他合并请求使用
+      const sharedData = { buffer: responseBody, headers };
+      // 自身也要修正 ID
+      const fixedBody = fixDNSId(responseBody, parsed.id);
+      const response = new Response(fixedBody, { headers });
 
       // 仅在 TTL > 0 且可以使用缓存时存入缓存
       if (useCache && ttl > 0 && ctx?.waitUntil) {
         ctx.waitUntil(cache.put(cacheKey, response.clone()));
       }
-      return response;
+      return { response, sharedData };
     })();
 
-    inflight.set(mergeKey, promise);
+    // 存储共享数据供其他请求使用，但需要同时返回 response 和 sharedData
+    // 由于我们存储的是 Promise，其 resolve 值包含 response 和 sharedData
+    // 但为了其他请求直接使用 sharedData，我们需要让 inflight 存储的 Promise 解析为 sharedData
+    // 为了保持统一，这里存储一个 Promise<sharedData>
+    const sharedPromise = promise.then(({ sharedData }) => sharedData);
+    inflight.set(mergeKey, sharedPromise);
     try {
-      return await promise;
+      const { response } = await promise;
+      return response;
     } finally {
       inflight.delete(mergeKey);
     }
