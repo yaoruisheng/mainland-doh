@@ -17,6 +17,12 @@ const UPSTREAM_URL = 'https://dns.google/dns-query';
 
 const inflight = new Map();         // 请求合并 Map
 
+// ==================== 预计算 HEX 表（性能优化）====================
+const HEX = new Array(256);
+for (let i = 0; i < 256; i++) {
+  HEX[i] = (i < 16 ? '0' : '') + i.toString(16);
+}
+
 // ==================== 辅助函数 ====================
 
 /**
@@ -91,30 +97,29 @@ function getSubnetKey(ip, prefix) {
   let key = '';
   for (let i = 0; i < len; i++) {
     const b = masked[i];
-    key += (b < 16 ? '0' : '') + b.toString(16);
+    key += HEX[b];                     // 使用预计算表
   }
   return key;
 }
 
-// ==================== DNS 解析（高性能版）====================
+// ==================== DNS 解析（0-copy 高性能版）====================
 
 /**
- * 解析 DNS 查询报文
- * 返回 { qname, qtype, qclass, doFlag, ednsVersion }
+ * 解析 DNS 查询报文，直接生成十六进制键，避免构造域名字符串
+ * 返回 { key, qtype, qclass, doFlag, ednsVersion, id }
  */
 function parseDNSQuery(buffer) {
   if (buffer.byteLength < 12 || buffer.byteLength > 4096) return null;
   const pkt = new Uint8Array(buffer);
+  const id = (pkt[0] << 8) | pkt[1];
   const flags = (pkt[2] << 8) | pkt[3];
   const qdCount = (pkt[4] << 8) | pkt[5];
   if ((flags >> 15) !== 0 || ((flags >> 11) & 0xf) !== 0 || qdCount !== 1) return null;
 
-  // 读取域名（内联，减少函数调用）
   let pos = 12;
-  let nameLabels = [];
-  let ptrDepth = 0;
   let firstNextPos = -1;
   let steps = 0;
+  let key = '';                     // 直接构建十六进制键
 
   while (steps++ < 100) {
     if (pos >= pkt.length) return null;
@@ -125,30 +130,29 @@ function parseDNSQuery(buffer) {
       break;
     }
     if ((len & 0xc0) === 0xc0) {
-      if (pos + 1 >= pkt.length || ptrDepth >= 10) return null;
+      if (pos + 1 >= pkt.length) return null;
       const ptr = ((len & 0x3f) << 8) | pkt[pos + 1];
       if (ptr < 12 || ptr >= pkt.length) return null;
       if (firstNextPos === -1) firstNextPos = pos + 2;
       pos = ptr;
-      ptrDepth++;
       continue;
     }
     if (len > 63) return null;          // 标签长度超限
     pos++;
     if (pos + len > pkt.length) return null;
-    const labelBytes = pkt.subarray(pos, pos + len);
-    // 二进制安全转换：每个字节转为对应字符（0-255）
-    let labelStr = '';
-    for (let i = 0; i < labelBytes.length; i++) {
-      labelStr += String.fromCharCode(labelBytes[i]);
+    // 使用预计算 HEX 表，避免临时字符串和条件判断
+    for (let i = 0; i < len; i++) {
+      key += HEX[pkt[pos + i]];
     }
-    nameLabels.push(labelStr);
+    key += '.';                          // 添加分隔符，便于调试，不影响唯一性
     pos += len;
   }
   if (firstNextPos === -1 || steps >= 100) return null;
 
-  const qname = nameLabels.join('.').toLowerCase();
-  if (qname.length > 255) return null;
+  // 检查总长度（十六进制编码后每个字节对应2字符，加上点号，长度应 ≤ 2*255+254=764，但为了安全仍然检查原始长度）
+  // 原始域名长度限制已在循环中通过标签长度间接控制，但为防止恶意构造，额外检查十六进制键长度
+  if (key.length > 764) return null;    // 最大理论值 2*255 + 254 = 764
+
   if (firstNextPos + 4 > pkt.length) return null;
   const qtype = (pkt[firstNextPos] << 8) | pkt[firstNextPos + 1];
   const qclass = (pkt[firstNextPos + 2] << 8) | pkt[firstNextPos + 3];
@@ -184,7 +188,7 @@ function parseDNSQuery(buffer) {
     }
     arPos = rrPos + 10 + rdlen;
   }
-  return { qname, qtype, qclass, doFlag, ednsVersion };
+  return { key, qtype, qclass, doFlag, ednsVersion, id };
 }
 
 // ==================== TTL 解析（支持负响应）====================
@@ -465,6 +469,23 @@ function injectECS(buffer, clientIP, prefix, ednsVersion) {
   }
 }
 
+// ==================== DNS ID 修正 ====================
+
+/**
+ * 修正 DNS 响应中的事务 ID 为指定值
+ * @param {ArrayBuffer} responseBuffer - 原始响应
+ * @param {number} id - 新的 ID (0-65535)
+ * @returns {ArrayBuffer} 修正后的响应
+ */
+function fixDNSId(responseBuffer, id) {
+  const buf = new Uint8Array(responseBuffer);
+  if (buf.length < 2) return responseBuffer;
+  const newBuf = new Uint8Array(buf);
+  newBuf[0] = (id >> 8) & 0xff;
+  newBuf[1] = id & 0xff;
+  return newBuf.buffer;
+}
+
 // ==================== 主处理函数 ====================
 
 async function handleDoH(request, env, ctx) {
@@ -485,14 +506,13 @@ async function handleDoH(request, env, ctx) {
     const parsed = parseDNSQuery(queryBuffer);
     if (!parsed) return new Response('Bad Request', { status: 400 });
 
-    // 构建缓存键（包含 qclass）
-    const isV6 = clientIP.includes(':');
+    // 构建缓存键（使用十六进制 key，无需编码）
+    const isV6 = clientIP.indexOf(':') !== -1;   // 优化 IPv6 检测
     const prefix = isV6 ? ECS_CONFIG.ipv6Prefix : ECS_CONFIG.ipv4Prefix;
     const subnetKey = getSubnetKey(clientIP, prefix);
-    // 若客户端 IP 无效，跳过缓存
     const useCache = subnetKey !== 'unknown';
     const cacheKey = useCache
-      ? `https://cache.local/${parsed.qname}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}/${subnetKey}`
+      ? `https://cache.local/${parsed.key}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}/${subnetKey}`
       : null;
 
     // 缓存读取
@@ -505,14 +525,25 @@ async function handleDoH(request, env, ctx) {
         if (err.status !== 504) console.error('Cache match error:', err);
       }
     }
-    if (cached) return cached;
+    if (cached) {
+      const responseBody = await cached.arrayBuffer();
+      const fixedBody = fixDNSId(responseBody, parsed.id);
+      const headers = new Headers(cached.headers);
+      const newResponse = new Response(fixedBody, { headers });
+      return newResponse;
+    }
 
     // 请求合并（使用与缓存相同的键，若未使用缓存则用临时键）
-    const mergeKey = useCache ? cacheKey : `merge:${parsed.qname}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}`;
-    if (inflight.has(mergeKey)) return inflight.get(mergeKey);
+    const mergeKey = useCache ? cacheKey : `merge:${parsed.key}/${parsed.qtype}/${parsed.qclass}/${parsed.doFlag}`;
+    if (inflight.has(mergeKey)) {
+      const shared = await inflight.get(mergeKey);
+      const fixedBody = fixDNSId(shared.buffer, parsed.id);
+      const response = new Response(fixedBody, { headers: shared.headers });
+      return response;
+    }
 
+    // 创建新的请求
     const promise = (async () => {
-      // 注入 ECS 并请求上游（传递 EDNS 版本）
       const finalQuery = injectECS(queryBuffer, clientIP, prefix, parsed.ednsVersion);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
@@ -532,29 +563,35 @@ async function handleDoH(request, env, ctx) {
       }
 
       if (!upstreamRes.ok) {
-        return new Response('Upstream DNS error', { status: 502 });
+        throw new Error(`Upstream responded with ${upstreamRes.status}`);
       }
 
       const responseBody = await upstreamRes.arrayBuffer();
-      const ttl = parseMinTTL(responseBody);  // 已支持 0 TTL
+      const ttl = parseMinTTL(responseBody);
+      const headers = {
+        'content-type': 'application/dns-message',
+      };
+      if (ttl > 0) {
+        headers['cache-control'] = `max-age=${ttl}`;
+      } else {
+        headers['cache-control'] = 'no-store';
+      }
 
-      const response = new Response(responseBody, {
-        headers: {
-          'content-type': 'application/dns-message',
-          'cache-control': `max-age=${ttl}`,
-        },
-      });
+      const sharedData = { buffer: responseBody, headers };
+      const fixedBody = fixDNSId(responseBody, parsed.id);
+      const response = new Response(fixedBody, { headers });
 
-      // 仅在 TTL > 0 且可以使用缓存时存入缓存
       if (useCache && ttl > 0 && ctx?.waitUntil) {
         ctx.waitUntil(cache.put(cacheKey, response.clone()));
       }
-      return response;
+      return { response, sharedData };
     })();
 
-    inflight.set(mergeKey, promise);
+    const sharedPromise = promise.then(({ sharedData }) => sharedData);
+    inflight.set(mergeKey, sharedPromise);
     try {
-      return await promise;
+      const { response } = await promise;
+      return response;
     } finally {
       inflight.delete(mergeKey);
     }
@@ -564,20 +601,15 @@ async function handleDoH(request, env, ctx) {
   }
 }
 
-// ==================== HTTP 路由 ====================
-
+/**
+ * =========================
+ * Router
+ * =========================
+ */
 async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
-  if (url.pathname === '/') {
-    return new Response(
-      'Welcome to DNS Proxy Gateway\n\nEndpoints:\n- /dns-query\n- /resolve',
-      { headers: { 'content-type': 'text/plain; charset=utf-8' } }
-    );
-  }
-  if (url.pathname === '/dns-query') {
-    return handleDoH(request, env, ctx);
-  }
-  // 其他请求（如 /resolve）直接转发
+  if (url.pathname === "/") {return new Response('Welcome to DNS Proxy Gateway\n\nEndpoints:\n- /dns-query\n- /resolve',{ headers: { 'content-type': 'text/plain; charset=utf-8' } });}
+  if (url.pathname === '/dns-query') {return handleDoH(request, env, ctx);}
   const upstreamUrl = new URL('https://dns.google' + url.pathname + url.search);
   return fetch(upstreamUrl, {
     method: request.method,
