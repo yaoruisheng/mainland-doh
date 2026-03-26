@@ -15,7 +15,6 @@ const UPSTREAM_TIMEOUT = 5000;     // 5秒超时
 
 const UPSTREAM_URL = 'https://dns.google/dns-query';
 
-const decoder = new TextDecoder();
 const inflight = new Map();         // 请求合并 Map
 
 // ==================== 辅助函数 ====================
@@ -138,17 +137,21 @@ function parseDNSQuery(buffer) {
     pos++;
     if (pos + len > pkt.length) return null;
     const labelBytes = pkt.subarray(pos, pos + len);
-    // 移除字符合法性检查（允许任意 8 位字节，符合 RFC 1035）
-    nameLabels.push(decoder.decode(labelBytes));
+    // 二进制安全转换：每个字节转为对应字符（0-255）
+    let labelStr = '';
+    for (let i = 0; i < labelBytes.length; i++) {
+      labelStr += String.fromCharCode(labelBytes[i]);
+    }
+    nameLabels.push(labelStr);
     pos += len;
   }
   if (firstNextPos === -1 || steps >= 100) return null;
 
   const qname = nameLabels.join('.').toLowerCase();
+  if (qname.length > 255) return null;
   if (firstNextPos + 4 > pkt.length) return null;
   const qtype = (pkt[firstNextPos] << 8) | pkt[firstNextPos + 1];
   const qclass = (pkt[firstNextPos + 2] << 8) | pkt[firstNextPos + 3];
-  // 移除 qclass === 1 的硬性限制，允许所有类
 
   // 解析 EDNS（OPT RR）
   let arPos = firstNextPos + 4;
@@ -175,7 +178,7 @@ function parseDNSQuery(buffer) {
     const type = (pkt[rrPos] << 8) | pkt[rrPos + 1];
     const rdlen = (pkt[rrPos + 8] << 8) | pkt[rrPos + 9];
     if (type === 41) {
-      const ttl = (pkt[rrPos + 4] << 24) | (pkt[rrPos + 5] << 16) | (pkt[rrPos + 6] << 8) | pkt[rrPos + 7];
+      const ttl = ((pkt[rrPos + 4] << 24) >>> 0) | (pkt[rrPos + 5] << 16) | (pkt[rrPos + 6] << 8) | pkt[rrPos + 7];
       doFlag = (ttl & 0x8000) ? 1 : 0;
       ednsVersion = (ttl >> 16) & 0xff;          // 提取 EDNS 版本（TTL 高 8 位）
     }
@@ -229,7 +232,7 @@ function parseMinTTL(buffer) {
       }
       if (pos + 10 > pkt.length) break;
       const type = (pkt[pos] << 8) | pkt[pos + 1];
-      const ttl = (pkt[pos + 4] << 24) | (pkt[pos + 5] << 16) | (pkt[pos + 6] << 8) | pkt[pos + 7];
+      const ttl = ((pkt[pos + 4] << 24) >>> 0) | (pkt[pos + 5] << 16) | (pkt[pos + 6] << 8) | pkt[pos + 7];
       const rdlen = (pkt[pos + 8] << 8) | pkt[pos + 9];
       if (pos + 10 + rdlen > pkt.length) break;
 
@@ -259,7 +262,7 @@ function parseMinTTL(buffer) {
           // 跳过 SERIAL, REFRESH, RETRY, EXPIRE (各 4 字节)
           offset += 16;
           if (offset + 4 <= dataStart + rdlen) {
-            const minimum = (pkt[offset] << 24) | (pkt[offset + 1] << 16) | (pkt[offset + 2] << 8) | pkt[offset + 3];
+            const minimum = ((pkt[offset] << 24) >>> 0) | (pkt[offset + 1] << 16) | (pkt[offset + 2] << 8) | pkt[offset + 3];
             soaMin = Math.min(soaMin, minimum);
           }
         }
@@ -367,7 +370,9 @@ function injectECS(buffer, clientIP, prefix, ednsVersion) {
   const ipBytes = ipToBytes(clientIP);
   if (!ipBytes) return buffer;
   const isV6 = ipBytes.length === 16;
-  const actualPrefix = prefix ?? (isV6 ? ECS_CONFIG.ipv6Prefix : ECS_CONFIG.ipv4Prefix);
+  const maxBits = isV6 ? 128 : 32;
+  const defaultPrefix = isV6 ? ECS_CONFIG.ipv6Prefix : ECS_CONFIG.ipv4Prefix;
+  const actualPrefix = Math.min(prefix ?? defaultPrefix, maxBits);
   const addr = applyPrefixMask(ipBytes, actualPrefix).subarray(0, Math.ceil(actualPrefix / 8));
 
   const ecsDataLen = 2 + 1 + 1 + addr.length; // FAMILY(2) + SOURCE(1) + SCOPE(1) + ADDR
